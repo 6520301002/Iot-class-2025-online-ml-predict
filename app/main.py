@@ -2,6 +2,8 @@ import os
 import logging
 import joblib  # For saving/loading the model
 import json
+import numpy as np
+import pandas as pd
 from datetime import datetime, timezone
 from river import tree, preprocessing, metrics
 from quixstreams import Application
@@ -10,6 +12,7 @@ from influxdb_client import InfluxDBClient, Point, WriteOptions
 
 # Load environment variables from .env file
 load_dotenv(".env")
+n = 0
 
 # Configure logging
 log_level_str = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -21,16 +24,18 @@ logging.basicConfig(
 )
 
 # Load configurations
-KAFKA_BROKER = os.getenv("KAFKA_BROKER", "localhost:9092")
-KAFKA_INPUT_TOPIC = os.getenv("KAFKA_INPUT_TOPIC", "event-frames-model")
-KAFKA_OUTPUT_TOPIC = os.getenv("KAFKA_OUTPUT_TOPIC", "fan-speed-prediction")
-MODEL_LOCATION = os.getenv("MODEL_LOCATION", "/app/fan_speed_model.pkl")
+KAFKA_BROKER = os.getenv("KAFKA_BROKER", "172.16.2.117:9092")
+KAFKA_INPUT_TOPIC = os.getenv("KAFKA_INPUT_TOPIC", "event-battery")
+KAFKA_OUTPUT_TOPIC = os.getenv("KAFKA_OUTPUT_TOPIC", "prediction-battery-RUL")
+MODEL_LOCATION = os.getenv("MODEL_LOCATION", "C:/Users/pattanapong/Desktop/IOT/random_forest_model.pkl")
 
-INFLUX_URL = os.getenv("INFLUX_URL")
-INFLUX_TOKEN = os.getenv("INFLUX_TOKEN")
-INFLUX_ORG = os.getenv("INFLUX_ORG")
-INFLUX_BUCKET = os.getenv("INFLUX_BUCKET")
+INFLUX_URL = os.getenv("INFLUX_URL", "http://172.16.2.117:8085")
+INFLUX_TOKEN = os.getenv("INFLUX_TOKEN", "eUq5Fj9zSW4lvJtuxymghnC_jJzS8EbNdFkNs_ZCYqsQx3yiHYIR2TxbM5SfpbqKRaxTZIHsJEZ8OMtKpoLv3A==")
+INFLUX_ORG = os.getenv("INFLUX_ORG", "org-6510301011")
+INFLUX_BUCKET = os.getenv("INFLUX_BUCKET", "bucket-6510301011")
 
+print(f"{INFLUX_URL} {INFLUX_TOKEN} {INFLUX_ORG} {INFLUX_BUCKET} ")
+exit
 # Initialize InfluxDB client
 try:
     influx_client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
@@ -43,14 +48,15 @@ except Exception as e:
 # Load or initialize the online model
 if os.path.exists(MODEL_LOCATION):
     model = joblib.load(MODEL_LOCATION)
-    logging.info(f"✅ Loaded model from {MODEL_LOCATION}")
+    logging.info(f"✅ Loaded regression model from {MODEL_LOCATION}")
 else:
-    model = preprocessing.StandardScaler() | tree.HoeffdingTreeClassifier()
-    logging.info(f"📦 Initialized new model")
+    model = preprocessing.StandardScaler() | tree.HoeffdingTreeRegressor()
+    logging.info(f"📦 Initialized new regression model")
 
 # Metrics for evaluation
-metric_acc = metrics.Accuracy()
+metric_rmse = metrics.RMSE()
 metric_mae = metrics.MAE()
+metric_r2 = metrics.R2()   # ✅ เพิ่ม metric R²
 
 # Record counter for triggering model save
 counter = 0
@@ -62,7 +68,7 @@ try:
         loglevel="INFO",
         auto_offset_reset="earliest",
         state_dir=os.path.join(os.path.dirname(os.path.abspath(__file__)), "state"),
-        consumer_group="predict-from-kafka-online"
+        consumer_group="predict-from-kafka-onlineV19"
     )
     input_topic = app.topic(KAFKA_INPUT_TOPIC, value_deserializer="json")
     producer = app.get_producer()
@@ -78,100 +84,147 @@ def handle_message(data):
     try:
         sensor_name = data.get("name", "")
         payload = data.get("payload", {})
+        timestamp_d = data.get("__Timestamp__")
+        # ดึง features จาก payload
+        Max_Voltage_Discharg = payload.get("Max_Voltage_Discharg")
+        Min_Voltage_Charg = payload.get("Min_Voltage_Charg")
+        Discharge_Time = payload.get("Discharge_Time")
+        Decrement = payload.get("Decrement")
+        Time = payload.get("Time")
+        Time_constant_current = payload.get("Time_constant_current")
+        Charging_time = payload.get("Charging_time")
+
+        # ตรวจสอบว่ามีค่า features หรือไม่
+        if None in [
+            Max_Voltage_Discharg,
+            Min_Voltage_Charg,
+            Discharge_Time,
+            Decrement,
+            Time,
+            Time_constant_current,
+            Charging_time
+        ]:
+            logging.error("❌ Missing one or more features in payload, skipping this message")
+            return
+
+        # Features dict สำหรับ model
         x = {
-            "temperature": payload["temperature"],
-            "humidity": payload["humidity"],
-            "pressure": payload["pressure"]
+            "Discharge_Time": float(Discharge_Time),
+            "Decrement": float(Decrement),
+            "Max_Voltage_Discharg": float(Max_Voltage_Discharg),
+            "Min_Voltage_Charg": float(Min_Voltage_Charg),
+            "Time": float(Time),
+            "Time_constant_current": float(Time_constant_current),
+            "Charging_time": float(Charging_time)
         }
-        
-        # Make prediction before learning
-        prediction = model.predict_one(x)
 
-        # Convert timestamp to datetime (UTC)
-        timestamp = datetime.fromtimestamp(
-            payload.get("timestamp", datetime.now().timestamp() * 1000) / 1000.0,
-            tz=timezone.utc
-        )
+        # Predict RUL
+        if hasattr(model, "predict_one"):  
+            prediction = model.predict_one(x)
+        elif hasattr(model, "predict"):  
 
-        if sensor_name == "iot_sensor_0":
-            actual_fan_speed = payload.get("fan_speed", None)
-            if actual_fan_speed is not None:
-                # Update the model with true value
-                model.learn_one(x, actual_fan_speed)
+            # กำหนด order ของ column ตามตอน train
+            columns_order = [
+                "Discharge_Time",
+                "Decrement",
+                "Max_Voltage_Discharg",
+                "Min_Voltage_Charg",
+                "Time",
+                "Time_constant_current",
+                "Charging_time"
+            ]
 
-                # Update metrics
-                metric_acc.update(actual_fan_speed, prediction)
-                metric_mae.update(actual_fan_speed, prediction)
+            # แปลงทุกค่าเป็น float
+            x_df = pd.DataFrame([{
+                col: float(x[col]) for col in columns_order
+            }], columns=columns_order)
 
-                logging.info(f"🔍[Model Sensor] {sensor_name} Predict={prediction}, Target={actual_fan_speed}, Acc={metric_acc.get():.3f}, MAE={metric_mae.get():.3f}")
-
-                # Save the model every 10 records
-                counter += 1
-                if counter % 10 == 0:
-                    joblib.dump(model, MODEL_LOCATION)
-                    logging.info(f"💾 Model saved after {counter} records to {MODEL_LOCATION}")
-                    counter = 0
-            else:
-                logging.warning("[Model Sensor] fan_speed not found in payload")
-                logging.warning(f"📥 First learn only: Target={actual_fan_speed}")
-
-            # Build output payload including actual and predicted values
-            result_payload = {
-                "temperature": payload["temperature"],
-                "humidity": payload["humidity"],
-                "pressure": payload["pressure"],
-                "fan_speed": int(actual_fan_speed) if actual_fan_speed is not None else None,
-                "fan_speed_predicted": int(prediction),
-                "timestamp": int(timestamp.timestamp() * 1000),
-                "date": timestamp.isoformat()
-            }
+            prediction = model.predict(x_df)[0]
 
         else:
-            # For other sensors (only prediction)
-            result_payload = {
-                "temperature": payload["temperature"],
-                "humidity": payload["humidity"],
-                "pressure": payload["pressure"],
-                "fan_speed_predicted": int(prediction),
-                "timestamp": int(timestamp.timestamp() * 1000),
-                "date": timestamp.isoformat()
-            }
+            raise AttributeError("❌ Model does not support predict or predict_one")
 
-        # Compose final Kafka message
+        cycle_index = payload.get("Cycle_Index", 0)
+        timestamp = datetime.now(timezone.utc)
+        actual_rul = payload.get("RUL", None)
+
+        if actual_rul is not None:
+            actual_rul = float(actual_rul)
+            # Update model
+            if hasattr(model, "learn_one"):
+                model.learn_one(x, actual_rul)
+
+            # Update metrics
+            metric_rmse.update(actual_rul, prediction)
+            metric_mae.update(actual_rul, prediction)
+            metric_r2.update(actual_rul, prediction)  # ✅ อัปเดต R²
+
+            logging.info(
+                f"🔍 Cycle={cycle_index}, Predict={prediction:.2f}, "
+                f"Target={actual_rul}, RMSE={metric_rmse.get():.3f}, "
+                f"MAE={metric_mae.get():.3f}, R²={metric_r2.get():.3f}"
+            )
+
+            counter += 1
+            if counter % 10 == 0:
+                joblib.dump(model, MODEL_LOCATION)
+                logging.info(f"💾 Model saved after {counter} records to {MODEL_LOCATION}")
+                counter = 0
+        else:
+            logging.warning("[Battery Dataset] RUL not found in payload")
+
+        # Build result payload (เก็บฟีเจอร์ด้วย)
+        result_payload = {
+            "Discharge_Time": Discharge_Time,
+            "Decrement": Decrement,
+            "Max_Voltage_Discharg": Max_Voltage_Discharg,
+            "Min_Voltage_Charg": Min_Voltage_Charg,
+            "Time": Time,
+            "Time_constant_current": Time_constant_current,
+            "Charging_time": Charging_time,
+            "RUL": int(actual_rul) if actual_rul is not None else None,
+            "RUL_predicted": float(prediction),
+            "r2": float(metric_r2.get()),   # ✅ เปลี่ยนจาก accuracy → r2
+            "cycle_index": cycle_index,
+            "timestamp": int(timestamp.timestamp() * 1000),
+            "date": timestamp.isoformat()
+        }
         result = {
             "id": data.get("id", ""),
             "name": sensor_name,
             "place_id": data.get("place_id", ""),
-            "payload": result_payload
+            "payload": result_payload,
+            "__Timestamp__": timestamp_d
         }
 
-        new_payload = json.dumps(result).encode('utf-8')
+        new_payload = json.dumps(result).encode("utf-8")
 
-        # Send result to Kafka output topic
+        # ส่งไป Kafka
         producer.produce(
             topic=output_topic.name,
             key=sensor_name,
             value=new_payload,
             timestamp=int(timestamp.timestamp() * 1000)
         )
-        logging.info(f"[📤] Sent prediction to Kafka topic: {KAFKA_OUTPUT_TOPIC}, payload: {json.dumps(result)}")
-
-        # Write only prediction to InfluxDB
+        logging.info(f"[📤] Sent prediction to Kafka topic: {KAFKA_OUTPUT_TOPIC}")
+        timestamp_ns = int(timestamp_d * 1_000_000)
+        # เขียน prediction ไป InfluxDB
         point = (
-            Point("fan_speed_prediction")
+            Point("battery_rul_prediction")
             .tag("sensor_id", data.get("id", "unknown"))
             .tag("place_id", data.get("place_id", "unknown"))
             .tag("name", sensor_name)
-            .field("fan_speed_predicted", int(prediction))
-            .time(timestamp)
+            .field("RUL_predicted", float(prediction))
+            .field("r2", float(metric_r2.get()))   # ✅ เปลี่ยนจาก accuracy → r2
+            .field("RUL", float(payload.get("RUL", None)))
+            .time(timestamp_ns)
         )
         influx_writer.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
         logging.info("[📊] Wrote prediction to InfluxDB")
 
-    except KeyError as e:
-        logging.error(f"❌ Missing key in payload: {e}")
     except Exception as e:
         logging.error(f"❌ Error processing message: {e}")
+
 
 # Apply the message handler to Kafka dataframe stream
 sdf = app.dataframe(input_topic)
